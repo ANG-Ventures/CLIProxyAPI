@@ -301,7 +301,7 @@ func (s *Session) save(st state) error {
 	name := f.Name()
 	defer os.Remove(name)
 	if _, err = f.Write(raw); err == nil {
-		err = f.Sync()
+		err = syncFd(int(f.Fd()))
 	}
 	closeErr := f.Close()
 	if err != nil || closeErr != nil {
@@ -315,11 +315,22 @@ func (s *Session) save(st state) error {
 		return Error("store_write")
 	}
 	defer dir.Close()
-	if dir.Sync() != nil {
+	if syncFd(int(dir.Fd())) != nil {
 		return Error("store_write")
 	}
 	return nil
 }
+
+// syncFd is the sync save uses on the temp file and the directory: fsync(2)
+// on every platform (t_1f4b978a). Not (*os.File).Sync: on darwin that is
+// F_FULLFSYNC, a drive-cache flush that under the Studio's write load held
+// the store lock up to 1.45 s per commit while the requests that need the
+// commit waited. fsync(2) is what Sync already is on linux, and nothing more
+// is needed: the map lives in a per-start dir (darwin) or tmpfs (linux) and
+// a restarted unit mints a new binding, so the map never outlives power loss
+// usefully. A test seam; production never reassigns it.
+var syncFd = syscall.Fsync
+
 func symbol(b Binding, kind, original string) string {
 	key, _ := json.Marshal([]string{b.Principal, b.Session, b.Version, kind, original})
 	return "dpx_v1_" + kind + "_" + digest(string(key))[:24]
