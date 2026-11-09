@@ -320,6 +320,10 @@ func (s *Session) save(st state) error {
 	}
 	return nil
 }
+// syncFd is the durability sync save uses: fsync(2) on every platform
+// (t_1f4b978a). A test seam; production never reassigns it.
+var syncFd = syscall.Fsync
+
 func symbol(b Binding, kind, original string) string {
 	key, _ := json.Marshal([]string{b.Principal, b.Session, b.Version, kind, original})
 	return "dpx_v1_" + kind + "_" + digest(string(key))[:24]
