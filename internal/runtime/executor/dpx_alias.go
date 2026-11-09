@@ -184,3 +184,22 @@ func dpxAliasUpstreamError(resp *http.Response, m *contentalias.RequestMap) dpxA
 	out.msg = string(m.RestoreErrorBody(raw))
 	return out
 }
+
+// observeClaudeSSEUsage feeds a buffered Claude SSE body to usage: each line,
+// plus each event's joined multi-line data: frame (upstream v8.0.53 shape), so
+// the alias path counts a frame split across lines.
+func observeClaudeSSEUsage(buf *helps.StreamUsageBuffer, data []byte) {
+	var eventBuf bytes.Buffer
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		eventBuf.Write(line)
+		eventBuf.WriteByte('\n')
+		if len(bytes.TrimSpace(line)) == 0 {
+			buf.ObserveClaudeSSEEvent(eventBuf.Bytes())
+			eventBuf.Reset()
+		}
+		buf.ObserveClaudeStream(line)
+	}
+	if eventBuf.Len() > 0 {
+		buf.ObserveClaudeSSEEvent(eventBuf.Bytes())
+	}
+}

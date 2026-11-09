@@ -235,7 +235,11 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	applyClaudePreservedThinkingBindingDoc(doc)
 	ctx, aliasPreparedBody, aliasMap, err := e.prepareDPXAlias(ctx, doc.Bytes(), opts, confirmedClaudeCode, cloaked)
 	if err != nil { return resp, err }
+	// Response translators and plugin response hooks pair the request with a
+	// RESTORED response, so they get the pre-alias body (fleet 71d126fc shape).
+	var preAliasBody []byte
 	if aliasMap != nil {
+		preAliasBody = doc.Bytes()
 		doc = ojson.NewDoc(aliasPreparedBody)
 	}
 	cchBilling := ""
@@ -266,6 +270,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	bodyForUpstream := doc.Bytes()
 	body = bodyForUpstream
 	bodyForTranslation := bodyForUpstream
+	if preAliasBody != nil {
+		bodyForTranslation = preAliasBody
+	}
 	if cchSigning {
 		bodyForUpstream, err = signAnthropicMessagesBody(bodyForUpstream)
 		if err != nil {
@@ -377,7 +384,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if aliasMap != nil {
 		if upstreamStream {
 			var originalUsage helps.StreamUsageBuffer
-			for _, line := range bytes.Split(data, []byte("\n")) { originalUsage.ObserveClaudeStream(line) }
+			observeClaudeSSEUsage(&originalUsage, data)
 			originalUsage.Publish(ctx, reporter)
 		} else { reporter.Publish(ctx, helps.ParseClaudeUsage(data)) }
 		if upstreamStream { data, err = aliasMap.RestoreSSE(data) } else { data, err = aliasMap.RestoreJSON(data) }

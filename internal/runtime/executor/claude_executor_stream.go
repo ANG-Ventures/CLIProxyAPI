@@ -232,7 +232,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	applyClaudePreservedThinkingBindingDoc(doc)
 	ctx, aliasPreparedBody, aliasMap, err := e.prepareDPXAlias(ctx, doc.Bytes(), opts, confirmedClaudeCode, cloaked)
 	if err != nil { return nil, err }
+	// Response translators and plugin response hooks pair the request with a
+	// RESTORED response, so they get the pre-alias body (fleet 71d126fc shape).
+	var preAliasBody []byte
 	if aliasMap != nil {
+		preAliasBody = doc.Bytes()
 		doc = ojson.NewDoc(aliasPreparedBody)
 	}
 	cchBilling := ""
@@ -260,6 +264,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	bodyForUpstream := doc.Bytes()
 	body = bodyForUpstream
 	bodyForTranslation := bodyForUpstream
+	if preAliasBody != nil {
+		bodyForTranslation = preAliasBody
+	}
 	if cchSigning {
 		bodyForUpstream, err = signAnthropicMessagesBody(bodyForUpstream)
 		if err != nil {
