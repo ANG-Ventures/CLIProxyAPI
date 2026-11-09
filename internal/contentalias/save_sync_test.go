@@ -16,15 +16,14 @@ import (
 )
 
 func TestSaveSyncsThroughFsyncNotFullFsync(t *testing.T) {
+	raw := syntheticBody(t, fixtureSizes[0])
+	s := testSession(t) // Create's own save is not counted
 	var mu sync.Mutex
 	calls := 0
 	prev := syncFd
 	syncFd = func(fd int) error { mu.Lock(); calls++; mu.Unlock(); return prev(fd) }
 	t.Cleanup(func() { syncFd = prev })
 	holds := recordLockHolds(t)
-
-	raw := syntheticBody(t, fixtureSizes[0])
-	s := testSession(t)
 	if _, _, err := Prepare(raw, s); err != nil { // cold: allocates and commits once
 		t.Fatal(err)
 	}
