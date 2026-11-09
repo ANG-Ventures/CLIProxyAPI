@@ -153,6 +153,11 @@ type heldLock struct {
 // production builds, where unlock pays one nil check.
 var lockHeldHook func(held time.Duration)
 
+// saveStallHook runs inside save just before the rename that publishes the
+// map. Only tests set it, to reproduce a slow commit (the Studio measured
+// 210-476 ms renames of map.json, t_1f4b978a); nil in production.
+var saveStallHook func()
+
 func unlock(h *heldLock) {
 	if hook := lockHeldHook; hook != nil {
 		hook(time.Since(h.at))
@@ -306,6 +311,9 @@ func (s *Session) save(st state) error {
 	closeErr := f.Close()
 	if err != nil || closeErr != nil {
 		return Error("store_write")
+	}
+	if hook := saveStallHook; hook != nil {
+		hook()
 	}
 	if err = os.Rename(name, filepath.Join(s.dir, "map.json")); err != nil {
 		return Error("store_write")

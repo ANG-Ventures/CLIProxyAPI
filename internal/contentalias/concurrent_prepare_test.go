@@ -205,6 +205,77 @@ func TestPrepareP90FlatAt30Goroutines(t *testing.T) {
 	}
 }
 
+// The cold-start convoy (t_1f4b978a canary, 2026-11-09): a unit restarts with
+// an empty map, and the first 30 concurrent requests all carry the SAME new
+// tools. Every one of them computes the same new map lock-free and then wants
+// to commit it. Before the fix all 30 called commitIfUnchanged, so 29 waited on
+// the flock behind the winner's save; the Studio's save took up to 1.45 s
+// (renames of map.json measured 210-476 ms), so the canary read lockWait p90
+// 1455 ms on round 1 and 0 on round 2. A request whose map turns out to be
+// what another request already committed must not wait for that commit: it
+// waits only until map.json carries its allocations, which needs no flock.
+func TestColdIdenticalPreparesDoNotQueueOnTheCommit(t *testing.T) {
+	raw := syntheticBody(t, fixtureSizes[0])
+	dir, b := unitStore(t)
+	const stall = 500 * time.Millisecond
+	var stalls sync.Mutex
+	saveStallHook = func() { stalls.Lock(); time.Sleep(stall); stalls.Unlock() }
+	t.Cleanup(func() { saveStallHook = nil })
+	const n = 30
+	waits := make([]time.Duration, n)
+	wires := make([][]byte, n)
+	errs := make(chan error, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s, err := Open(dir, b, DefaultManifest())
+			if err != nil {
+				errs <- err
+				return
+			}
+			<-start
+			wires[i], _, err = Prepare(raw, s)
+			waits[i] = s.LockWait()
+			errs <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1; i < n; i++ {
+		if string(wires[i]) != string(wires[0]) {
+			t.Fatalf("request %d went out with different aliases than request 0", i)
+		}
+	}
+	queued := 0
+	for _, w := range waits {
+		if w >= stall/2 {
+			queued++
+		}
+	}
+	t.Logf("cold identical Prepares x%d, commit stalled %v: lockWait p50 %v p90 %v max %v, %d waited >= %v",
+		n, stall, percentile(waits, .5), p90(waits), percentile(waits, 1), queued, stall/2)
+	if got := p90(waits); got >= stall/5 {
+		t.Fatalf("lockWait p90 %v with the commit stalled %v: %d of %d identical cold Prepares queued on the "+
+			"store flock behind one commit of the map they all computed (t_1f4b978a cold-start convoy)", got, stall, queued, n)
+	}
+	s, err := Open(dir, b, DefaultManifest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.load(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Concurrent map-changing requests (distinct new tools, all at once) must each
 // persist and agree with the map: optimistic commits never drop a writer.
 func TestConcurrentMapChangesAllPersist(t *testing.T) {
