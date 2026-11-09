@@ -301,7 +301,7 @@ func (s *Session) save(st state) error {
 	name := f.Name()
 	defer os.Remove(name)
 	if _, err = f.Write(raw); err == nil {
-		err = fsync(f)
+		err = f.Sync()
 	}
 	closeErr := f.Close()
 	if err != nil || closeErr != nil {
@@ -315,19 +315,11 @@ func (s *Session) save(st state) error {
 		return Error("store_write")
 	}
 	defer dir.Close()
-	if fsync(dir) != nil {
+	if dir.Sync() != nil {
 		return Error("store_write")
 	}
 	return nil
 }
-
-// fsync is fsync(2) on every platform. (*os.File).Sync is F_FULLFSYNC on
-// darwin, which flushes the whole drive's write cache: under a Studio's write
-// load (26 units' wirelog spools) one cold commit held the store lock ~1.4 s
-// and 29 concurrent requests queued behind it (t_1f4b978a canary). The map
-// never outlives CPA (per-start dir on darwin, tmpfs on linux), so the
-// device-cache flush buys nothing; fsync(2) is what linux's Sync already does.
-func fsync(f *os.File) error { return syscall.Fsync(int(f.Fd())) }
 func symbol(b Binding, kind, original string) string {
 	key, _ := json.Marshal([]string{b.Principal, b.Session, b.Version, kind, original})
 	return "dpx_v1_" + kind + "_" + digest(string(key))[:24]
