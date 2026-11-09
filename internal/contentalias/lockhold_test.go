@@ -7,7 +7,8 @@ package contentalias
 // whole units. TestEncodeTextIsLinearInTextSize covers that one function;
 // these gates cover the class:
 //
-//   - TestPrepareLockHoldBudget: the lock-hold budget on 50/200/450 KB bodies.
+//   - TestPrepareLockHoldBudget: the commit's lock-hold budget on 50/200/450 KB
+//     bodies, and warm Prepares take no hold.
 //   - TestPreparePerformanceUnderParallelCallers: N=16 concurrent requests on
 //     one unit state; queueing must stay proportional to the hold.
 //   - TestPrepareScalesLinearly: 1x/4x/16x bodies on three axes (text, tools,
@@ -30,8 +31,10 @@ import (
 )
 
 const (
-	// lockHoldBudget is the per-request store-lock budget on the 450 KB synthetic body.
-	lockHoldBudget = 100 * time.Millisecond
+	// commitHoldBudget bounds one commit's store-lock hold: re-read map.json,
+	// compare, save (marshal + fsync). No per-request work runs under the lock
+	// (t_1f4b978a); fsync measured 1.6-15 ms on the loaded ci-box.
+	commitHoldBudget = 40 * time.Millisecond
 	// concurrentWorkers is how many requests race on one unit state.
 	concurrentWorkers = 16
 	// blockedWaitBudget bounds the time one solo Prepare spends blocked (sleep,
@@ -42,15 +45,8 @@ const (
 	// 200/256 (fsync of map.json). A 50 ms wait under the lock adds at least
 	// 50 ms to every run.
 	blockedWaitBudget = 40 * time.Millisecond
-	// queueMargin is how far the N-caller p95 may exceed the sum of the
-	// store-lock holds recorded during the N-caller phase itself (plus one solo
-	// latency for the work outside the lock). The last caller waits for every
-	// other hold, so p95 ~ that sum on correct code; host load stretches both
-	// sides alike. A slow step that serializes callers outside the store flock
-	// (invisible to the hold) pushes the ratio past it.
-	queueMargin = 1.25
 	// prepareCPURatio bounds the CPU one solo Prepare costs (all of it under the
-	// store lock) against a same-run reference: 8 json.Valid passes over the same
+	// store-free snapshot work) against a same-run reference: 8 json.Valid passes over the same
 	// body, both the best thread-CPU time of 7 runs. A loaded or slower host
 	// scales both alike. Measured 1.7-2.5 on ACE-AI and the loaded ci-box; the
 	// pre-#24 unanchored encode scan and a linear symbol-collision scan measure
@@ -95,10 +91,9 @@ func percentile(ds []time.Duration, p float64) time.Duration {
 	return s[i]
 }
 
-// The first Prepare allocates every tool alias and writes the map; later ones
-// load a populated map. Both shapes must stay inside the budget at every size.
-// lockHoldBudget is generous for CI runners (measured holds are ~10x below it)
-// and still far below the seconds-long holds of the t_129cf1ac class.
+// The first Prepare allocates every tool alias and commits the map; later ones
+// read the populated map, change nothing and take no lock. The one commit must
+// stay inside commitHoldBudget at every size.
 func TestPrepareLockHoldBudget(t *testing.T) {
 	for _, size := range fixtureSizes {
 		raw := syntheticBody(t, size)
@@ -111,16 +106,16 @@ func TestPrepareLockHoldBudget(t *testing.T) {
 			}
 		}
 		got := holds()
-		if len(got) != runs {
-			t.Fatalf("lock hook saw %d holds for %d Prepare calls", len(got), runs)
+		// The cold Prepare allocates and commits (one hold); warm Prepares add
+		// nothing to the map and take no lock at all (t_1f4b978a).
+		if len(got) != 1 {
+			t.Fatalf("lock hook saw %d holds for %d Prepare calls on one body, want 1 (the cold commit): "+
+				"a warm Prepare that changes nothing must not take the store lock (t_1f4b978a)", len(got), runs)
 		}
-		t.Logf("store-lock holds on %d B body: %v (median %v)", len(raw), got, median(got))
-		if first := got[0]; first >= lockHoldBudget*3 {
-			t.Fatalf("first Prepare held the store lock %v on a %d B body (cold-map budget %v)", first, len(raw), lockHoldBudget*3)
-		}
-		if m := median(got[1:]); m >= lockHoldBudget {
-			t.Fatalf("Prepare held the store lock %v (median of %d) on a %d B request; budget %v. "+
-				"Every request on the unit waits behind this (t_129cf1ac)", m, runs-1, len(raw), lockHoldBudget)
+		t.Logf("store-lock holds on %d B body: %v", len(raw), got)
+		if first := got[0]; first >= commitHoldBudget {
+			t.Fatalf("the cold Prepare's commit held the store lock %v on a %d B body (budget %v): the commit is "+
+				"re-read + save only, per-request work belongs outside the lock (t_129cf1ac, t_1f4b978a)", first, len(raw), commitHoldBudget)
 		}
 	}
 }
@@ -139,17 +134,14 @@ func threadSched() (cpu, runqueue time.Duration, ok bool) {
 	return time.Duration(c), time.Duration(r), true
 }
 
-// Prepare serializes on the store lock by design (load -> alias -> save is one
-// read-modify-write of map.json), so N concurrent requests finish no faster
-// than N holds. The gate is that the queue is explained by the hold, with every
-// bound relative to this run's own measurements (a shared CI box stretches all
-// of them alike; a fixed 800 ms wall-clock cap failed there on correct code,
-// t_dae16eeb):
+// Prepare does its work on a lock-free snapshot and takes the store lock only
+// to commit a changed map (t_1f4b978a), so warm callers take no hold at all.
+// Every bound is relative to this run's own measurements (a shared CI box
+// stretches all of them alike; a fixed 800 ms wall-clock cap failed there on
+// correct code, t_dae16eeb):
 //
-//   - queue: N=16 p95 <= queueMargin x (sum of the store-lock holds recorded
-//     during the N=16 phase) + one solo latency. Fails a slow step that
-//     serializes callers without showing in the hold (under Session.mu outside
-//     the flock, a second global lock).
+//   - no hold: N=16 warm callers and the solo runs record zero store-lock holds.
+//     The parallel queue itself is gated by TestPrepareP90FlatAt30Goroutines.
 //   - CPU: the best solo Prepare costs <= prepareCPURatio x the CPU of a
 //     fixed reference workload on the same body. Fails superlinear or wasted
 //     work under the lock, which inflates the hold and so hides from the queue
@@ -202,7 +194,7 @@ func TestPreparePerformanceUnderParallelCallers(t *testing.T) {
 	}
 	runtime.UnlockOSThread()
 	soloHolds := holds()
-	l1, h1 := median(solo), median(soloHolds)
+	l1 := median(solo)
 
 	lat := make([]time.Duration, concurrentWorkers)
 	errs := make(chan error, concurrentWorkers)
@@ -229,19 +221,13 @@ func TestPreparePerformanceUnderParallelCallers(t *testing.T) {
 	}
 	p95 := percentile(lat, 0.95)
 	parHolds := holds()[len(soloHolds):]
-	if len(parHolds) != concurrentWorkers {
-		t.Fatalf("lock hook saw %d holds for %d concurrent Prepare calls", len(parHolds), concurrentWorkers)
-	}
-	var queue time.Duration
-	for _, h := range parHolds {
-		queue += h
-	}
-	t.Logf("N=1 latency %v hold %v best blocked %v, CPU %v (%.1fx reference %v); N=%d p95 %v (sum of holds %v, p95/holds %.2f, ratio to N=1 latency %.1fx)",
-		l1, h1, blocked, prepCPU, float64(prepCPU)/float64(max(refCPU, 1)), refCPU, concurrentWorkers, p95, queue, float64(p95)/float64(queue), float64(p95)/float64(l1))
-	if limit := time.Duration(queueMargin*float64(queue)) + l1; p95 > limit {
-		t.Fatalf("N=%d p95 %v exceeds %.2f x the %v the %d store-lock holds account for + one solo latency %v = %v: "+
-			"callers serialize on more than the store-lock hold (t_129cf1ac)",
-			concurrentWorkers, p95, queueMargin, queue, concurrentWorkers, l1, limit)
+	t.Logf("N=1 latency %v, %d solo holds, best blocked %v, CPU %v (%.1fx reference %v); N=%d p95 %v (%.1fx N=1), %d holds",
+		l1, len(soloHolds), blocked, prepCPU, float64(prepCPU)/float64(max(refCPU, 1)), refCPU, concurrentWorkers, p95, float64(p95)/float64(l1), len(parHolds))
+	// Warm callers change nothing, so none of them may take the store lock; the
+	// queue they could build is bounded by TestPrepareP90FlatAt30Goroutines.
+	if len(soloHolds)+len(parHolds) != 0 {
+		t.Fatalf("warm Prepares took %d store-lock holds (want 0): a request that changes nothing serializes the unit (t_1f4b978a)",
+			len(soloHolds)+len(parHolds))
 	}
 	if !haveSched {
 		t.Logf("no /proc/thread-self/schedstat on %s: CPU and blocked-wait checks skipped", runtime.GOOS)
