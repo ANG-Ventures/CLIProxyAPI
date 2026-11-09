@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
-	"time"
 )
 
 type RequestMap struct {
@@ -25,10 +24,52 @@ func Prepare(raw []byte, s *Session) ([]byte, *RequestMap, error) {
 	if n.kind != '{' {
 		return nil, nil, Error("request")
 	}
-	waitStart := time.Now()
-	s.mu.Lock()
-	s.lockWait += time.Since(waitStart)
-	defer s.mu.Unlock()
+	// Optimistic: decode a snapshot of map.json WITHOUT the store lock (save
+	// replaces it by atomic rename, so a read sees one whole map), do all the
+	// per-request work on that private copy, and take the flock only to commit
+	// a map that changed (t_1f4b978a). A request that adds nothing returns with
+	// no lock at all: the map only grows, so every alias it used stays valid
+	// and it is ordered at its snapshot. A commit whose snapshot went stale
+	// (another request committed first) redoes the work on the new map.
+	for attempt := 0; attempt < optimisticAttempts; attempt++ {
+		if attempt > 0 {
+			if n, err = parse(raw); err != nil {
+				return nil, nil, err
+			}
+		}
+		file, err := s.readMap()
+		if err != nil {
+			return nil, nil, err
+		}
+		st, payload, err := s.decodeMap(file)
+		if err != nil {
+			return nil, nil, err
+		}
+		wire, m, st, err := prepareOn(raw, n, st)
+		if err != nil {
+			return nil, nil, err
+		}
+		after, err := json.Marshal(st)
+		if err != nil {
+			return nil, nil, Error("store_write")
+		}
+		if bytes.Equal(after, payload) {
+			m.st = st
+			return wire, m, nil
+		}
+		committed, err := s.commitIfUnchanged(file, st)
+		if err != nil {
+			return nil, nil, err
+		}
+		if committed {
+			m.st = st
+			return wire, m, nil
+		}
+	}
+	// Contended past optimisticAttempts: do it under the lock (always progresses).
+	if n, err = parse(raw); err != nil {
+		return nil, nil, err
+	}
 	lock, err := s.lock()
 	if err != nil {
 		return nil, nil, err
@@ -38,17 +79,34 @@ func Prepare(raw []byte, s *Session) ([]byte, *RequestMap, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	wire, m, st, err := prepareOn(raw, n, st)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := s.save(st); err != nil {
+		return nil, nil, err
+	}
+	m.st = st
+	return wire, m, nil
+}
+
+// optimisticAttempts bounds the lock-free tries before Prepare serializes.
+const optimisticAttempts = 3
+
+// prepareOn aliases raw (parsed as n) against st and returns the wire body, the
+// request map and st with every allocation this request made. Pure: no store I/O.
+func prepareOn(raw []byte, n *node, st state) ([]byte, *RequestMap, state, error) {
 	m := &RequestMap{st: st, schemas: map[string]*schema{}, allowed: map[string]bool{}, reverse: map[string]string{}}
 	edits := []edit{}
 	if tools := n.get("tools"); tools != nil {
 		if tools.kind != '[' {
-			return nil, nil, Error("tools")
+			return nil, nil, st, Error("tools")
 		}
 		seen := map[string]bool{}
 		for _, tool := range tools.items {
 			name := tool.get("name").str()
 			if name == "" || seen[name] {
-				return nil, nil, Error("tool_duplicate")
+				return nil, nil, st, Error("tool_duplicate")
 			}
 			seen[name] = true
 		}
@@ -60,11 +118,11 @@ func Prepare(raw []byte, s *Session) ([]byte, *RequestMap, error) {
 				continue
 			}
 			if strings.HasPrefix(name, "dpx_v1_") {
-				return nil, nil, Error("reserved_tool")
+				return nil, nil, st, Error("reserved_tool")
 			}
 			schemaNode := tool.get("input_schema")
 			if schemaNode == nil {
-				return nil, nil, Error("schema")
+				return nil, nil, st, Error("schema")
 			}
 			// A declared schema always re-pins the stored one (t_dbf31d31). The map
 			// outlives client builds, so refusing a changed schema (the old
@@ -75,11 +133,11 @@ func Prepare(raw []byte, s *Session) ([]byte, *RequestMap, error) {
 			schemaRaw := bytes.Clone(raw[schemaNode.start:schemaNode.end])
 			alias, err := st.allocate("t", name)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, st, err
 			}
 			for other := range seen {
 				if alias == other {
-					return nil, nil, Error("tool_collision")
+					return nil, nil, st, Error("tool_collision")
 				}
 			}
 			st.Tools[name] = storedTool{alias, schemaRaw}
@@ -87,12 +145,12 @@ func Prepare(raw []byte, s *Session) ([]byte, *RequestMap, error) {
 			m.reverse[alias] = name
 			sc, err := compileSchema(schemaNode, &st, name, &edits)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, st, err
 			}
 			m.schemas[name] = sc
 			edits = append(edits, replace(tool.get("name"), alias))
 			if err := textEdit(tool.get("description"), st.encodeText, &edits); err != nil {
-				return nil, nil, err
+				return nil, nil, st, err
 			}
 		}
 	}
@@ -102,12 +160,12 @@ func Prepare(raw []byte, s *Session) ([]byte, *RequestMap, error) {
 		}
 		root, err := parse(tool.Schema)
 		if err != nil {
-			return nil, nil, Error("store_schema")
+			return nil, nil, st, Error("store_schema")
 		}
 		discard := []edit{}
 		sc, err := compileSchema(root, &st, name, &discard)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, st, err
 		}
 		m.schemas[name] = sc
 	}
@@ -115,39 +173,35 @@ func Prepare(raw []byte, s *Session) ([]byte, *RequestMap, error) {
 		name := choice.get("name")
 		tool, ok := st.Tools[name.str()]
 		if !ok || !m.allowed[name.str()] {
-			return nil, nil, Error("tool_choice")
+			return nil, nil, st, Error("tool_choice")
 		}
 		edits = append(edits, replace(name, tool.Alias))
 	}
 	encodeContent := func(content *node) error { return m.forwardContent(content, &st, &edits) }
 	if err := encodeContent(n.get("system")); err != nil {
-		return nil, nil, err
+		return nil, nil, st, err
 	}
 	if messages := n.get("messages"); messages != nil {
 		if messages.kind != '[' {
-			return nil, nil, Error("messages")
+			return nil, nil, st, Error("messages")
 		}
 		for _, message := range messages.items {
 			if err := encodeContent(message.get("content")); err != nil {
-				return nil, nil, err
+				return nil, nil, st, err
 			}
 		}
 	}
 	wire, err := apply(raw, edits)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, st, err
 	}
 	// Source duplicate keys and schema/argument collisions were checked above;
 	// edits replace only typed JSON strings. Validate the emitted grammar without
 	// allocating a second multi-megabyte syntax tree that is immediately discarded.
 	if !json.Valid(wire) {
-		return nil, nil, Error("json")
+		return nil, nil, st, Error("json")
 	}
-	if err := s.save(st); err != nil {
-		return nil, nil, err
-	}
-	m.st = st
-	return wire, m, nil
+	return wire, m, st, nil
 }
 func (m *RequestMap) forwardContent(n *node, st *state, edits *[]edit) error {
 	if n == nil {

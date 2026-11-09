@@ -4,37 +4,50 @@ The content-alias layer is a fork patch: upstream syncs never fix or guard it.
 
 ## Performance invariants
 
-`Prepare` holds the unit's exclusive store lock (`Session.mu` plus the `map/lock`
-flock) from `load` through alias allocation, schema compile, text encode, edit
-apply, `json.Valid` and `save`. Every request on a DPX unit queues behind the
-Prepare in flight, so the lock hold is the unit's request rate. Incident
-t_129cf1ac: a quadratic `encodeText` held the lock 3.4-5.6 s on a 444 KB prompt
-and serialized whole units for over an hour (bridge 600 s timeouts, 2,000+ 5xx).
+`Prepare` does all per-request work (map decode, alias allocation, schema compile,
+text encode, edit apply, `json.Valid`) on a private copy of `map.json` read WITHOUT
+the store lock: `save` replaces the file by atomic rename, so an unlocked read sees
+one whole map. A request that adds nothing to the map (the warm steady state)
+returns without taking the lock: the map only grows, so every alias it used stays
+valid and the request is ordered at its snapshot. A request that changes the map
+takes the `map/lock` flock only to commit: re-read, compare with its snapshot,
+`save`. A stale snapshot (another request committed first) redoes the work on the
+new map, lock-free, up to 3 times, then once under the lock. `Open` reads without
+the flock too. `Session.mu` guards only the lock-wait counter (t_1f4b978a).
 
-Budgets, enforced by `lockhold_test.go` (runs in dpx-gates via lab_gate's
-`alias_proofs` arm, `go test ./internal/contentalias`):
+Incidents: t_129cf1ac, a quadratic `encodeText` under the old whole-Prepare lock
+(3.4-5.6 s holds on a 444 KB prompt, units serialized for over an hour); t_1f4b978a,
+the lock itself: 30 concurrent turns on dpx-25 queued to prepare p90 1449 ms vs
+261 ms at 5 (lock wait p90 1399 ms).
 
-- Lock hold (`TestPrepareLockHoldBudget`) on synthetic 50/200/450 KB bodies
-  generated in-test (`synthetic_fixture_test.go`: 60 tools, 60 messages, a
-  manifest word and a codec literal every 2 KB): median < 100 ms on a warm map,
-  < 300 ms on the first (cold) Prepare. The budget is generous for CI runners.
-- N=16 concurrent Prepares on one unit (`TestPreparePerformanceUnderParallelCallers`):
-  p95 <= 1.25 x the sum of the 16 store-lock holds recorded in that phase + one
-  solo latency; the best of 7 solo Prepares costs <= 5x the thread CPU of 8
-  `json.Valid` passes over the same body; and it spends < 40 ms blocked (wall
-  minus thread CPU minus runqueue wait, `/proc/thread-self/schedstat`: sleep, I/O).
-  Every bound is relative to the same run, so a loaded CI host stretches both
-  sides alike (a fixed 800 ms cap failed on correct code on the ci-box, t_dae16eeb).
-  Prepare serializes by design, so the bound is on the queue, not a ratio to N=1.
+Budgets, enforced in `go test ./internal/contentalias` (dpx-gates via lab_gate's
+`alias_proofs` arm):
+
+- Commit hold (`TestPrepareLockHoldBudget`) on synthetic 50/200/450 KB bodies
+  generated in-test (`synthetic_fixture_test.go`: 60 tools, 60 messages, a manifest
+  word and a codec literal every 2 KB): the cold Prepare commits once (< 40 ms
+  hold), and warm Prepares take no hold.
+- Warm Prepares never wait for the lock (`TestWarmPrepareDoesNotWaitForStoreLock`):
+  30 complete while another fd holds the flock; a map-changing Prepare still waits.
+- 30 goroutines (`TestPrepareP90FlatAt30Goroutines`): Open+Prepare p90 <= 2x the
+  p90 of the same work by 30 goroutines with no store and no lock, same run (the
+  reference absorbs host cores, SMT and load; a shared lock puts the 30th caller
+  ~30 solo latencies back). Measured on ACE-AI: 0.96-1.46x; an in-process mutex
+  around Prepare ~2.6x+.
+- Concurrent map changes all persist (`TestConcurrentMapChangesAllPersist`).
+- N=16 warm callers (`TestPreparePerformanceUnderParallelCallers`): zero holds; the
+  best of 7 solo Prepares costs <= 5x the thread CPU of 8 `json.Valid` passes over
+  the same body, and spends < 40 ms blocked (wall minus thread CPU minus runqueue
+  wait, `/proc/thread-self/schedstat`: sleep, I/O).
 - 1x/4x/16x scaling (`TestPrepareScalesLinearly`), each axis alone (system text, tool catalog, message
   history) through Prepare, and text through both decode paths (`RestoreJSON`,
   the SSE `Stream`): 16x/1x <= 64 (linear ~16, quadratic ~256).
 
 Mutation check: `python3 scripts/dpx/contentalias_lockhold_mutants.py` re-introduces
-seven members of the class (unanchored encode scan, 50 ms sleep under the lock,
-slow CPU work under `Session.mu` outside the flock, quadratic tool walk, linear symbol-allocation scan, quadratic JSON decode, SSE
-history rescan) and exits 1 if any stays green. Run it on CI or ACE-AI; fleet
-hosts deny local `go test`.
+eight members of the class (unanchored encode scan, 50 ms sleep in the commit, a
+process-wide mutex around Prepare, `Open` re-taking the flock, quadratic tool walk,
+linear symbol-allocation scan, quadratic JSON decode, SSE history rescan) and exits
+1 if any stays green. Run it on CI or ACE-AI; fleet hosts deny local `go test`.
 
 ## History-only tool names (t_ca4ca1e2, t_63ed650a)
 

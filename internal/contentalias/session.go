@@ -65,15 +65,20 @@ type Session struct {
 	dir      string
 	binding  Binding
 	manifest Manifest
-	mu       sync.Mutex
-	// lockWait sums the time this session spent waiting for s.mu and the
-	// store flock (t_997bc8a2). A Session is opened per request, so the sum
-	// is that request's queueing behind other requests on the unit.
+	// mu guards lockWait only; it is never held across store work.
+	mu sync.Mutex
+	// lockWait sums the time this session spent waiting for the store flock
+	// (t_997bc8a2). A Session is opened per request, so the sum is that
+	// request's queueing behind other requests' commits on the unit.
 	lockWait time.Duration
 }
 
 // LockWait reports how long this session waited for the store lock so far.
-func (s *Session) LockWait() time.Duration { return s.lockWait }
+func (s *Session) LockWait() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lockWait
+}
 
 func session(dir string, b Binding, m Manifest) (*Session, error) {
 	if b.Principal == "" || b.Session == "" || !validVersion(b.Version) {
@@ -112,11 +117,8 @@ func Open(dir string, b Binding, m Manifest) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	lock, err := s.lock()
-	if err != nil {
-		return nil, err
-	}
-	defer unlock(lock)
+	// No flock: save replaces map.json by atomic rename, so this read sees one
+	// whole map (t_1f4b978a).
 	_, err = s.load()
 	return s, err
 }
@@ -128,7 +130,9 @@ func (s *Session) lock() (*heldLock, error) {
 	f := os.NewFile(uintptr(fd), "lock")
 	waitStart := time.Now()
 	err = syscall.Flock(fd, syscall.LOCK_EX)
+	s.mu.Lock()
 	s.lockWait += time.Since(waitStart)
+	s.mu.Unlock()
 	if err != nil {
 		f.Close()
 		return nil, Error("store_lock")
@@ -157,71 +161,107 @@ func unlock(h *heldLock) {
 	h.f.Close()
 }
 func (s *Session) load() (state, error) {
-	var st state
+	raw, err := s.readMap()
+	if err != nil {
+		return state{}, err
+	}
+	st, _, err := s.decodeMap(raw)
+	return st, err
+}
+
+// readMap returns map.json's bytes. Safe without the store lock: save replaces
+// the file by atomic rename, so the open fd is one complete map.
+func (s *Session) readMap() ([]byte, error) {
 	if _, err := session(s.dir, s.binding, s.manifest); err != nil {
-		return st, err
+		return nil, err
 	}
 	fd, err := syscall.Open(filepath.Join(s.dir, "map.json"), syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return st, Error("store_missing")
+		return nil, Error("store_missing")
 	}
 	f := os.NewFile(uintptr(fd), "map")
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || info.Size() > 16<<20 {
-		return st, Error("store_permissions")
+		return nil, Error("store_permissions")
 	}
 	raw := make([]byte, info.Size())
 	n, err := f.ReadAt(raw, 0)
 	if err != nil || n != len(raw) {
-		return st, Error("store_read")
+		return nil, Error("store_read")
 	}
+	return raw, nil
+}
+
+// commitIfUnchanged saves st under the store lock iff map.json still holds
+// snapshot (the bytes st was derived from). false = another request committed
+// first; the caller redoes its work on the new map.
+func (s *Session) commitIfUnchanged(snapshot []byte, st state) (bool, error) {
+	lock, err := s.lock()
+	if err != nil {
+		return false, err
+	}
+	defer unlock(lock)
+	cur, err := s.readMap()
+	if err != nil {
+		return false, err
+	}
+	if !bytes.Equal(cur, snapshot) {
+		return false, nil
+	}
+	return true, s.save(st)
+}
+
+// decodeMap validates map.json's bytes and returns the state and its canonical
+// payload (json.Marshal of the state, as save writes it).
+func (s *Session) decodeMap(raw []byte) (state, []byte, error) {
+	var st state
 	var env envelope
 	if _, err := parse(raw); err != nil {
-		return st, Error("store_corrupt")
+		return st, nil, Error("store_corrupt")
 	}
 	if json.Unmarshal(raw, &env) != nil || digest(string(env.Payload)) != env.Checksum || json.Unmarshal(env.Payload, &st) != nil {
-		return st, Error("store_corrupt")
+		return st, nil, Error("store_corrupt")
 	}
 	expected, _ := json.Marshal(s.manifest)
 	actual, _ := json.Marshal(st.Manifest)
 	if st.Binding != s.binding || string(expected) != string(actual) || st.Symbols == nil || st.Tools == nil {
-		return st, Error("store_version")
+		return st, nil, Error("store_version")
 	}
 	for alias, e := range st.Symbols {
 		if wordPairTools(st.Binding) && e.Kind == "t" {
 			if !validToolAlias(st.Binding, alias, e.Original) {
-				return st, Error("store_corrupt")
+				return st, nil, Error("store_corrupt")
 			}
 			if st.tools == nil {
 				st.tools = map[string]string{}
 			}
 			if _, dup := st.tools[e.Original]; dup {
-				return st, Error("store_corrupt")
+				return st, nil, Error("store_corrupt")
 			}
 			st.tools[e.Original] = alias
 			continue
 		}
 		if wordPairAliases(st.Binding) && e.Kind == "p" {
 			if !validPropertyAlias(st.Binding, alias, e.Original) {
-				return st, Error("store_corrupt")
+				return st, nil, Error("store_corrupt")
 			}
 			if st.properties == nil {
 				st.properties = map[string]string{}
 			}
 			if _, dup := st.properties[e.Original]; dup {
-				return st, Error("store_corrupt")
+				return st, nil, Error("store_corrupt")
 			}
 			st.properties[e.Original] = alias
 			continue
 		}
 		if alias != symbol(st.Binding, e.Kind, e.Original) {
-			return st, Error("store_corrupt")
+			return st, nil, Error("store_corrupt")
 		}
 	}
 	canonicalState, _ := json.Marshal(st)
 	if !bytes.Equal(canonicalState, env.Payload) {
-		return st, Error("store_corrupt")
+		return st, nil, Error("store_corrupt")
 	}
 	for name, tool := range st.Tools {
 		want := symbol(st.Binding, "t", name)
@@ -229,13 +269,13 @@ func (s *Session) load() (state, error) {
 			want = st.tools[name]
 		}
 		if want == "" || tool.Alias != want || st.Symbols[tool.Alias] != (entry{"t", name}) {
-			return st, Error("store_tool_relation")
+			return st, nil, Error("store_tool_relation")
 		}
 		if _, err := parse(tool.Schema); err != nil {
-			return st, Error("store_schema")
+			return st, nil, Error("store_schema")
 		}
 	}
-	return st, nil
+	return st, env.Payload, nil
 }
 func (s *Session) save(st state) error {
 	payload, err := json.Marshal(st)

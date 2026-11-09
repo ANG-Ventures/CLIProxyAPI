@@ -17,7 +17,9 @@ from pathlib import Path
 PKG = Path("internal/contentalias")
 GATES = ["TestPrepareLockHoldBudget",
          "TestPreparePerformanceUnderParallelCallers",
-         "TestPrepareScalesLinearly"]
+         "TestPrepareScalesLinearly",
+         "TestWarmPrepareDoesNotWaitForStoreLock",
+         "TestPrepareP90FlatAt30Goroutines"]
 
 
 def sub(pattern, repl, flags=0):
@@ -41,16 +43,23 @@ MUTANTS = [
     # Pre-#24 encodeText: try the unanchored regexp at every position.
     ("encode_unanchored_scan", "prose.go",
      sub(r'if strings\.HasPrefix\(text\[pos:\], "[^"]*"\) \{\n(\t\t\tif loc := codecPattern)', r"if true {\n\1")),
-    # Card mutant 2: a 50 ms wait under the lock.
-    ("sleep_50ms_under_lock", "request.go",
-     chain(sub(r"\tdefer unlock\(lock\)\n", "\tdefer unlock(lock)\n\ttime.Sleep(50 * time.Millisecond)\n"),
-           lambda s: s if '\t"time"\n' in s else sub(r'import \(\n', 'import (\n\t"time"\n')(s))),
-    # Serialization the store-lock hold cannot see: slow CPU work under Session.mu
-    # before the flock is taken (t_dae16eeb). Callers queue on it; the hold hook
-    # does not time it, and it is on-CPU, so only the queue bound catches it.
+    # Card mutant 2: a 50 ms wait under the lock (in the commit, the only hold left).
+    ("sleep_50ms_under_lock", "session.go",
+     sub(r"(func \(s \*Session\) commitIfUnchanged[^\n]*\n(?:.*\n)*?\tdefer unlock\(lock\)\n)",
+         r"\1\ttime.Sleep(50 * time.Millisecond)\n")),
+    # Serialization the store-lock hold cannot see: a process-wide mutex around
+    # Prepare's work (t_dae16eeb shape; the pre-t_1f4b978a design). The hold
+    # hook does not time it, so only the 30-goroutine p90 bound catches it.
     ("serialize_outside_flock", "request.go",
-     sub(r"(\tdefer s\.mu\.Unlock\(\)\n)",
-         r"\1\tfor i := 0; i < 20; i++ {\n\t\t_, _ = parse(raw)\n\t}\n")),
+     chain(sub(r"(\tfor attempt := 0; attempt < optimisticAttempts; attempt\+\+ \{\n)",
+               r"\tmutantMu.Lock()\n\tdefer mutantMu.Unlock()\n\1"),
+           lambda s: s + "\nvar mutantMu sync.Mutex\n",
+           sub(r'import \(\n', 'import (\n\t"sync"\n'))),
+    # Open re-takes the store flock for its read (the pre-t_1f4b978a Open):
+    # every request queues on the flock again.
+    ("open_takes_flock", "session.go",
+     sub(r"(\t// No flock: save replaces map\.json by atomic rename, so this read sees one\n\t// whole map \(t_1f4b978a\)\.\n)",
+         r"\1\tif lk, err := s.lock(); err == nil {\n\t\tdefer unlock(lk)\n\t}\n")),
     # Tool-schema walk: re-validate every declared schema per tool (O(T * bytes)).
     ("tool_walk_quadratic", "request.go",
      sub(r"(\t\t\tschemaRaw := bytes\.Clone\(raw\[schemaNode\.start:schemaNode\.end\]\)\n)",
