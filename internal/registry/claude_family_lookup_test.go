@@ -14,6 +14,8 @@ func TestLookupStaticModelInfoClaudeVariantsUseCatalogEntry(t *testing.T) {
 		{id: "claude-sonnet-5-5-20261001", family: "claude-sonnet-5-5"},
 		{id: "claude-fable-5[1m]", family: "claude-fable-5"},
 		{id: "claude-fable-5-1[1m]", family: "claude-fable-5-1"},
+		{id: "claude-fable-5-2", family: "claude-fable-5-2"},
+		{id: "claude-fable-5-2[1m]", family: "claude-fable-5-2"},
 		{id: "claude-haiku-4-5-20251001[1m]", family: "claude-haiku-4-5-20251001"},
 	}
 	for _, tt := range tests {

@@ -518,6 +518,16 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStreamWithState(c *gin.Context, flus
 			}
 			state.ensureSSEEventBoundary(c.Writer)
 
+			// An alias rewriter may have stopped at an upstream error frame.
+			// Once committed, preserve that frame byte-for-byte, not a locally
+			// serialized approximation of the upstream type/message.
+			var upstreamEvent interface{ SSEErrorEvent() []byte }
+			if errors.As(errMsg.Error, &upstreamEvent) {
+				if raw := upstreamEvent.SSEErrorEvent(); len(raw) > 0 {
+					_, _ = c.Writer.Write(raw)
+					return
+				}
+			}
 			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
 			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
 		},

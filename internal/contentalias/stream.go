@@ -3,6 +3,7 @@ package contentalias
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"unicode/utf8"
 )
@@ -90,6 +91,20 @@ func (s *Stream) Feed(raw []byte) ([]byte, error) {
 		event := bytes.Clone(s.buffer[:boundary+width])
 		s.buffer = s.buffer[boundary+width:]
 		if err := s.handle(event); err != nil {
+			var upstream *UpstreamStreamError
+			if errors.As(err, &upstream) {
+				// Release what was already complete (e.g. message_start, finished
+				// blocks) so a client that has seen headers gets the upstream error
+				// in stream order; incomplete (unready) blocks are never released.
+				for len(s.queue) > 0 && s.queue[0].ready {
+					out = append(out, s.queue[0].raw...)
+					s.queuedBytes -= len(s.queue[0].raw) + 64
+					s.queue[0] = nil
+					s.queue = s.queue[1:]
+				}
+				s.fail(err)
+				return out, err
+			}
 			return s.fail(err)
 		}
 		// Check restored expansion BEFORE releasing any executable frame.
@@ -378,7 +393,14 @@ func (s *Stream) handle(raw []byte) error {
 		}
 		s.ended = true
 	case "error":
-		return Error("upstream_stream_error")
+		// An upstream SSE error event (overloaded_error, api_error,
+		// rate_limit_error, ...) is an upstream fault, not a shape violation:
+		// surface it with its own type, message and status instead of a
+		// contentalias 400 (which the harness reads as "lane cannot serve
+		// this request shape"). Aliases in the message are restored.
+		upstream := newUpstreamStreamError(s.m.RestoreErrorBody(data), n.get("error").get("type").str())
+		upstream.event = bytes.Clone(raw)
+		return upstream
 	case "ping":
 	default:
 		return Error("stream_event")
