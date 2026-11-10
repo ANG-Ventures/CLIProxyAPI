@@ -11,6 +11,7 @@ import "net/http"
 // invalid_request_error.
 type UpstreamStreamError struct {
 	body   []byte
+	event  []byte // original SSE frame, retained for already-started streams
 	kind   string
 	status int
 }
@@ -64,6 +65,10 @@ func (e *UpstreamStreamError) Error() string { return string(e.body) }
 
 // ResponseBody exposes the upstream error JSON to handlers that prefer it.
 func (e *UpstreamStreamError) ResponseBody() []byte { return append([]byte(nil), e.body...) }
+
+// SSEErrorEvent returns the original upstream SSE frame, for a response whose
+// headers have already been sent. The frame is not reserialized or relabelled.
+func (e *UpstreamStreamError) SSEErrorEvent() []byte { return append([]byte(nil), e.event...) }
 
 // StatusCode is the HTTP status Anthropic uses for this error type.
 func (e *UpstreamStreamError) StatusCode() int { return e.status }

@@ -2,6 +2,7 @@ package claude
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,7 +51,12 @@ func TestClaudeMessagesHandlerContentAliasUpstreamStreamError(t *testing.T) {
 			if tc.committed {
 				chunks <- coreexecutor.StreamChunk{Payload: []byte(messageStart)}
 			}
-			upErr := contentalias.UpstreamStreamErrorFromEvent([]byte(`{"type":"error","error":{"type":"` + tc.kind + `","message":"Overloaded"}}`))
+			frame := "event: error\r\ndata: {\"type\":\"error\", \"error\":{\"type\":\"" + tc.kind + "\",\"message\":\"Overloaded\"},\"request_id\":\"req_original\"}\r\n\r\n"
+			_, rewriteErr := (&contentalias.RequestMap{}).NewStream().Feed([]byte(frame))
+			var upErr *contentalias.UpstreamStreamError
+			if !errors.As(rewriteErr, &upErr) {
+				t.Fatalf("rewriter error: %v", rewriteErr)
+			}
 			if upErr.StatusCode() != tc.status {
 				t.Fatalf("status map: %d want %d", upErr.StatusCode(), tc.status)
 			}
@@ -81,8 +87,8 @@ func TestClaudeMessagesHandlerContentAliasUpstreamStreamError(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("committed stream status %d", rec.Code)
 			}
-			if strings.Count(body, "event: error\n") != 1 || !strings.Contains(body, `"type":"`+tc.kind+`"`) || !strings.Contains(body, "Overloaded") {
-				t.Fatalf("want one upstream error event of type %s; body=%q", tc.kind, body)
+			if !strings.HasSuffix(body, frame) || strings.Count(body, "event: error") != 1 {
+				t.Fatalf("want original upstream frame byte-for-byte exactly once; body=%q", body)
 			}
 		})
 	}

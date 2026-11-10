@@ -398,7 +398,9 @@ func (s *Stream) handle(raw []byte) error {
 		// surface it with its own type, message and status instead of a
 		// contentalias 400 (which the harness reads as "lane cannot serve
 		// this request shape"). Aliases in the message are restored.
-		return newUpstreamStreamError(s.m.RestoreErrorBody(data), n.get("error").get("type").str())
+		upstream := newUpstreamStreamError(s.m.RestoreErrorBody(data), n.get("error").get("type").str())
+		upstream.event = bytes.Clone(raw)
+		return upstream
 	case "ping":
 	default:
 		return Error("stream_event")
