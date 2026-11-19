@@ -588,10 +588,19 @@ func (u *catalogUpdater) savedCatalogPath() string {
 }
 
 // persistableCatalogSource reports whether source is a remote catalog worth
-// saving. The embed and local files are already on disk; caching a local file
-// could also overwrite it if it sits at the cache path.
+// saving. "" is the built-in remote default (models.catalog unset). The embed
+// and local files are already on disk; caching a local file could also
+// overwrite it if it sits at the cache path.
 func persistableCatalogSource(source string) bool {
-	return source != "" && source != embeddedCatalogSource && source != "disabled" && !filepath.IsAbs(source)
+	return source != embeddedCatalogSource && source != "disabled" && !filepath.IsAbs(source)
+}
+
+// savedCatalogSourceKey names source in the saved envelope.
+func savedCatalogSourceKey(source string) string {
+	if source == "" {
+		return "default"
+	}
+	return source
 }
 
 // saveLocked writes the just-published catalog atomically. Caller holds u.mu.
@@ -600,7 +609,7 @@ func (u *catalogUpdater) saveLocked(source string, data []byte) {
 	if path == "" || !persistableCatalogSource(source) {
 		return
 	}
-	payload, errMarshal := json.Marshal(savedCatalog{Source: source, SavedAt: time.Now().UTC(), Catalog: json.RawMessage(data)})
+	payload, errMarshal := json.Marshal(savedCatalog{Source: savedCatalogSourceKey(source), SavedAt: time.Now().UTC(), Catalog: json.RawMessage(data)})
 	if errMarshal != nil {
 		log.WithError(errMarshal).Warnf("model catalog: cannot encode saved copy %s", path)
 		return
@@ -651,7 +660,7 @@ func (u *catalogUpdater) loadSavedLocked(source string) []string {
 		log.WithError(errDecode).Warnf("model catalog: saved copy %s is corrupt; using built-in catalog", path)
 		return nil
 	}
-	if saved.Source != source {
+	if saved.Source != savedCatalogSourceKey(source) {
 		log.Debugf("model catalog: saved copy %s is from another source; ignoring", path)
 		return nil
 	}

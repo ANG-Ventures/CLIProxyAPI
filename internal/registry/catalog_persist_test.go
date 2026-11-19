@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -203,5 +205,61 @@ func TestCatalogLocalSourceIsNotPersisted(t *testing.T) {
 	}
 	if !bytes.Equal(got, local) {
 		t.Fatalf("local catalog source %s was rewritten by the cache (%d -> %d bytes)", source, len(local), len(got))
+	}
+}
+
+// The fleet runs with models.catalog unset, so the updater is configured with
+// source "" (the built-in remote URLs). That default source must be saved and
+// restored too, or a restart without DNS lists only the embed.
+func TestCatalogDefaultSourceSavedAndRestored(t *testing.T) {
+	const newModel = "gpt-6.2-sol"
+	restoreEmbeddedCatalog(t)
+	dir := useCatalogStateDir(t)
+	if codexProHas(newModel) {
+		t.Fatalf("embed already lists %s; test needs a model absent from the embed", newModel)
+	}
+	remote := catalogWithExtraCodexModel(t, newModel)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(remote)
+	}))
+	urls := []string{server.URL + "/models.json"}
+
+	// First process: the default source publishes and is saved.
+	first := &catalogUpdater{
+		name:            "catalog",
+		fetchWithSource: dynamicCatalogFetcherWithSource(embeddedModelsJSON, &urls, validateCatalogBytes),
+		publish:         publishCatalogBytes,
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	first.configure(ctx1, "")
+	saved := filepath.Join(dir, "catalog.catalog")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, errStat := os.Stat(saved); errStat == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel1()
+			t.Fatalf("default-source refresh never wrote %s", saved)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel1()
+	server.Close()
+
+	// Restart: back on the embed, the default URLs unreachable.
+	if errLoad := loadModelsFromBytes(embeddedModelsJSON, "embed"); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	second := &catalogUpdater{
+		name:            "catalog",
+		fetchWithSource: dynamicCatalogFetcherWithSource(embeddedModelsJSON, &urls, validateCatalogBytes),
+		publish:         publishCatalogBytes,
+	}
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	second.configure(ctx2, "")
+	if !codexProHas(newModel) {
+		t.Fatalf("after restart with source \"\" and no network, %s missing: default-source catalog not restored", newModel)
 	}
 }
