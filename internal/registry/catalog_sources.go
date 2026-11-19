@@ -21,7 +21,10 @@ const embeddedCatalogSource = "embed"
 // Cancellation saves work; the generation check also protects against readers
 // that finish after cancellation (including local file reads).
 type catalogUpdater struct {
-	mu              sync.Mutex
+	mu sync.Mutex
+	// name keys the saved copy of the last published remote catalog; an
+	// empty name disables persistence.
+	name            string
 	source          string
 	generation      uint64
 	requestSeq      uint64
@@ -42,10 +45,14 @@ func (u *catalogUpdater) fetchCatalog(ctx context.Context, source string) ([]byt
 	return data, source, err
 }
 
+// catalogRetryInitialBackoff is the first retry delay after a failed startup
+// refresh; it doubles up to ModelsRefreshInterval until a refresh succeeds.
+var catalogRetryInitialBackoff = 30 * time.Second
+
 func (u *catalogUpdater) configure(ctx context.Context, source string) {
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	if u.cancel != nil && u.source == source && u.parentDone == ctx.Done() && u.ctx.Err() == nil {
+		u.mu.Unlock()
 		return
 	}
 	if u.cancel != nil {
@@ -59,13 +66,30 @@ func (u *catalogUpdater) configure(ctx context.Context, source string) {
 	u.ctx = refreshCtx
 	u.parentDone = ctx.Done()
 	if source == "disabled" {
+		u.mu.Unlock()
 		return
 	}
+	var savedChanged []string
+	if persistableCatalogSource(source) {
+		savedChanged = u.loadSavedLocked(source)
+	}
 	generation := u.generation
+	u.mu.Unlock()
+	notifyModelRefresh(savedChanged)
 	go func() {
-		u.refresh(refreshCtx, source, generation)
+		ok := u.refresh(refreshCtx, source, generation)
 		if source == embeddedCatalogSource {
 			return
+		}
+		for backoff := catalogRetryInitialBackoff; !ok; backoff = min(2*backoff, ModelsRefreshInterval) {
+			timer := time.NewTimer(backoff)
+			select {
+			case <-refreshCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			ok = u.refresh(refreshCtx, source, generation)
 		}
 		ticker := time.NewTicker(ModelsRefreshInterval)
 		defer ticker.Stop()
@@ -99,7 +123,9 @@ type CatalogRefreshResult struct {
 	ChangedProviders []string                       `json:"changed_providers"`
 }
 
-func (u *catalogUpdater) refresh(ctx context.Context, source string, generation uint64) {
+// refresh fetches and publishes one catalog. It reports false only when the
+// fetch or publish failed, so the caller knows to retry on backoff.
+func (u *catalogUpdater) refresh(ctx context.Context, source string, generation uint64) bool {
 	u.mu.Lock()
 	u.requestSeq++
 	seq := u.requestSeq
@@ -110,23 +136,25 @@ func (u *catalogUpdater) refresh(ctx context.Context, source string, generation 
 		if ctx.Err() == nil {
 			log.Warn("model catalog refresh failed; keeping last valid catalog")
 		}
-		return
+		return false
 	}
 	u.mu.Lock()
 	if generation != u.generation || seq <= u.publishedSeq || ctx.Err() != nil {
 		u.mu.Unlock()
-		return
+		return true
 	}
 	changed, errPublish := u.publish(data)
 	if errPublish == nil {
 		u.publishedSeq = seq
+		u.saveLocked(source, data)
 	}
 	u.mu.Unlock()
 	if errPublish != nil {
 		log.Warn("model catalog rejected; keeping last valid catalog")
-		return
+		return false
 	}
 	notifyModelRefresh(changed)
+	return true
 }
 
 func (u *catalogUpdater) refreshOnDemand(ctx context.Context, fallbackSource string, defaultURLs []string) (CatalogSourceStatus, error) {
@@ -221,6 +249,7 @@ func (u *catalogUpdater) refreshOnDemand(ctx context.Context, fallbackSource str
 	changed, errPublish := u.publish(data)
 	if errPublish == nil {
 		u.publishedSeq = seq
+		u.saveLocked(source, data)
 	}
 	u.mu.Unlock()
 	if errPublish != nil {
@@ -350,10 +379,12 @@ func dynamicCatalogFetcherWithSource(embedded []byte, urls *[]string, validate f
 }
 
 var generalCatalogUpdater = &catalogUpdater{
+	name:            "catalog",
 	fetchWithSource: dynamicCatalogFetcherWithSource(embeddedModelsJSON, &modelsURLs, validateCatalogBytes),
 	publish:         publishCatalogBytes,
 }
 var codexCatalogUpdater = &catalogUpdater{
+	name:            "codex-catalog",
 	fetchWithSource: dynamicCatalogFetcherWithSource(embeddedCodexClientModelsJSON, &codexClientModelsURLs, ValidateCodexClientModelsJSON),
 	publish: func(data []byte) ([]string, error) {
 		_, errLoad := loadCodexClientModelsFromBytes(data, "catalog")
@@ -361,6 +392,7 @@ var codexCatalogUpdater = &catalogUpdater{
 	},
 }
 var devinCatalogUpdater = &catalogUpdater{
+	name:            "devin-catalog",
 	fetchWithSource: dynamicCatalogFetcherWithSource(embeddedDevinModelsJSON, &devinModelsURLs, validateDevinCatalogBytes),
 	publish: func(data []byte) ([]string, error) {
 		changed, errLoad := loadDevinModelsFromBytes(data, "catalog")
@@ -517,4 +549,126 @@ func effectiveCatalogSources(sources CatalogSources, local, home bool) CatalogSo
 func validateDevinCatalogBytes(data []byte) error {
 	_, errValidate := ValidateDevinModelsJSON(data)
 	return errValidate
+}
+
+// catalogStateDir holds the saved copy of each updater's last published
+// remote catalog, so a restart without network does not fall back to the
+// build-time embed. Empty disables persistence.
+var catalogStateDir struct {
+	sync.Mutex
+	dir string
+}
+
+// SetModelCatalogStateDir sets where the last published remote catalogs are
+// saved and read back on startup. Call it before StartModelCatalogUpdaters.
+func SetModelCatalogStateDir(dir string) {
+	catalogStateDir.Lock()
+	defer catalogStateDir.Unlock()
+	catalogStateDir.dir = dir
+}
+
+// savedCatalog is the on-disk envelope. Source records which configured
+// source produced the bytes; a copy from another source is not loaded.
+type savedCatalog struct {
+	Source  string          `json:"source"`
+	SavedAt time.Time       `json:"saved_at"`
+	Catalog json.RawMessage `json:"catalog"`
+}
+
+// savedCatalogPath uses a .catalog suffix in a subdirectory so the auth
+// file store and watcher, which read *.json, never pick it up.
+func (u *catalogUpdater) savedCatalogPath() string {
+	catalogStateDir.Lock()
+	dir := catalogStateDir.dir
+	catalogStateDir.Unlock()
+	if dir == "" || u.name == "" {
+		return ""
+	}
+	return filepath.Join(dir, u.name+".catalog")
+}
+
+// persistableCatalogSource reports whether source is a remote catalog worth
+// saving. "" is the built-in remote default (models.catalog unset). The embed
+// and local files are already on disk; caching a local file could also
+// overwrite it if it sits at the cache path.
+func persistableCatalogSource(source string) bool {
+	return source != embeddedCatalogSource && source != "disabled" && !filepath.IsAbs(source)
+}
+
+// savedCatalogSourceKey names source in the saved envelope.
+func savedCatalogSourceKey(source string) string {
+	if source == "" {
+		return "default"
+	}
+	return source
+}
+
+// saveLocked writes the just-published catalog atomically. Caller holds u.mu.
+func (u *catalogUpdater) saveLocked(source string, data []byte) {
+	path := u.savedCatalogPath()
+	if path == "" || !persistableCatalogSource(source) {
+		return
+	}
+	payload, errMarshal := json.Marshal(savedCatalog{Source: savedCatalogSourceKey(source), SavedAt: time.Now().UTC(), Catalog: json.RawMessage(data)})
+	if errMarshal != nil {
+		log.WithError(errMarshal).Warnf("model catalog: cannot encode saved copy %s", path)
+		return
+	}
+	if errMkdir := os.MkdirAll(filepath.Dir(path), 0o700); errMkdir != nil {
+		log.WithError(errMkdir).Warnf("model catalog: cannot create %s", filepath.Dir(path))
+		return
+	}
+	tmp, errTemp := os.CreateTemp(filepath.Dir(path), "."+u.name+".*.tmp")
+	if errTemp != nil {
+		log.WithError(errTemp).Warnf("model catalog: cannot save %s", path)
+		return
+	}
+	_, errWrite := tmp.Write(payload)
+	errSync := tmp.Sync()
+	errClose := tmp.Close()
+	if errJoined := errors.Join(errWrite, errSync, errClose); errJoined != nil {
+		_ = os.Remove(tmp.Name())
+		log.WithError(errJoined).Warnf("model catalog: cannot save %s", path)
+		return
+	}
+	if errRename := os.Rename(tmp.Name(), path); errRename != nil {
+		_ = os.Remove(tmp.Name())
+		log.WithError(errRename).Warnf("model catalog: cannot save %s", path)
+	}
+}
+
+// loadSavedLocked publishes the saved copy for source, if any, and returns the
+// changed providers. A missing file is silent; an unreadable or invalid one
+// logs one warning and leaves the embedded catalog in place. Caller holds u.mu.
+func (u *catalogUpdater) loadSavedLocked(source string) []string {
+	path := u.savedCatalogPath()
+	if path == "" {
+		return nil
+	}
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		if !errors.Is(errRead, os.ErrNotExist) {
+			log.WithError(errRead).Warnf("model catalog: saved copy %s unreadable; using built-in catalog", path)
+		}
+		return nil
+	}
+	var saved savedCatalog
+	if errDecode := json.Unmarshal(raw, &saved); errDecode != nil || len(saved.Catalog) == 0 {
+		if errDecode == nil {
+			errDecode = fmt.Errorf("empty catalog")
+		}
+		log.WithError(errDecode).Warnf("model catalog: saved copy %s is corrupt; using built-in catalog", path)
+		return nil
+	}
+	if saved.Source != savedCatalogSourceKey(source) {
+		log.Debugf("model catalog: saved copy %s is from another source; ignoring", path)
+		return nil
+	}
+	changed, errPublish := u.publish(saved.Catalog)
+	if errPublish != nil {
+		log.WithError(errPublish).Warnf("model catalog: saved copy %s is invalid; using built-in catalog", path)
+		return nil
+	}
+	log.Infof("model catalog: loaded saved copy %s (saved %s)", path, saved.SavedAt.Format(time.RFC3339))
+	return changed
 }
