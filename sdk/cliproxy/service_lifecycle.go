@@ -457,6 +457,20 @@ func shutdownDrainTimeout() time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
+// modelCatalogStateDir picks where the last published remote catalogs are
+// saved: beside config.yaml, falling back to the auth dir when no config path
+// is known. Not inside the auth dir by default, because the PostgreSQL store
+// deletes and re-creates its auth spool on every Bootstrap.
+func modelCatalogStateDir(configPath string, cfg *config.Config) string {
+	if p := strings.TrimSpace(configPath); p != "" {
+		return filepath.Join(filepath.Dir(p), "model-catalog")
+	}
+	if authDir, errAuthDir := resolveCooldownStateAuthDir(cfg); errAuthDir == nil && authDir != "" {
+		return filepath.Join(authDir, "model-catalog")
+	}
+	return ""
+}
+
 // startModelCatalogUpdaters applies the same catalog policy for SDK and CLI users.
 func (s *Service) startModelCatalogUpdaters(ctx context.Context) {
 	s.cfgMu.RLock()
@@ -464,8 +478,8 @@ func (s *Service) startModelCatalogUpdaters(ctx context.Context) {
 	s.cfgMu.RUnlock()
 	proxyURL := ""
 	if cfg != nil {
-		if authDir, errAuthDir := resolveCooldownStateAuthDir(cfg); errAuthDir == nil && authDir != "" {
-			registry.SetModelCatalogStateDir(filepath.Join(authDir, "model-catalog"))
+		if stateDir := modelCatalogStateDir(s.configPath, cfg); stateDir != "" {
+			registry.SetModelCatalogStateDir(stateDir)
 		}
 		registry.StartModelCatalogUpdaters(ctx, cfg.Models, cfg.Home.Enabled)
 		proxyURL = cfg.ProxyURL

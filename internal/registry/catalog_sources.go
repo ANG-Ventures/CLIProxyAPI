@@ -70,7 +70,7 @@ func (u *catalogUpdater) configure(ctx context.Context, source string) {
 		return
 	}
 	var savedChanged []string
-	if source != embeddedCatalogSource {
+	if persistableCatalogSource(source) {
 		savedChanged = u.loadSavedLocked(source)
 	}
 	generation := u.generation
@@ -587,10 +587,17 @@ func (u *catalogUpdater) savedCatalogPath() string {
 	return filepath.Join(dir, u.name+".catalog")
 }
 
+// persistableCatalogSource reports whether source is a remote catalog worth
+// saving. The embed and local files are already on disk; caching a local file
+// could also overwrite it if it sits at the cache path.
+func persistableCatalogSource(source string) bool {
+	return source != "" && source != embeddedCatalogSource && source != "disabled" && !filepath.IsAbs(source)
+}
+
 // saveLocked writes the just-published catalog atomically. Caller holds u.mu.
 func (u *catalogUpdater) saveLocked(source string, data []byte) {
 	path := u.savedCatalogPath()
-	if path == "" || source == embeddedCatalogSource {
+	if path == "" || !persistableCatalogSource(source) {
 		return
 	}
 	payload, errMarshal := json.Marshal(savedCatalog{Source: source, SavedAt: time.Now().UTC(), Catalog: json.RawMessage(data)})

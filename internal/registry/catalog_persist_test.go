@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -176,5 +177,31 @@ func TestCatalogCorruptSavedCopyFallsBackToEmbed(t *testing.T) {
 	}
 	if warns != 1 {
 		t.Fatalf("saved-copy warnings = %d, want 1", warns)
+	}
+}
+
+// A local catalog file is never cached, so a local source at the cache path
+// is not overwritten with a cache envelope.
+func TestCatalogLocalSourceIsNotPersisted(t *testing.T) {
+	restoreEmbeddedCatalog(t)
+	dir := useCatalogStateDir(t)
+	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
+		t.Fatal(errMkdir)
+	}
+	source := filepath.Join(dir, "catalog.catalog")
+	local := catalogWithExtraCodexModel(t, "gpt-6.2-sol")
+	if errWrite := os.WriteFile(source, local, 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	u := &catalogUpdater{name: "catalog", fetch: readCatalogSource, publish: publishCatalogBytes}
+	if !u.refresh(context.Background(), source, u.generation) {
+		t.Fatal("local refresh failed")
+	}
+	got, errRead := os.ReadFile(source)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	if !bytes.Equal(got, local) {
+		t.Fatalf("local catalog source %s was rewritten by the cache (%d -> %d bytes)", source, len(local), len(got))
 	}
 }
