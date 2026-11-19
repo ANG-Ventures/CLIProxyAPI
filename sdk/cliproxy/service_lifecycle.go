@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -463,6 +464,9 @@ func (s *Service) startModelCatalogUpdaters(ctx context.Context) {
 	s.cfgMu.RUnlock()
 	proxyURL := ""
 	if cfg != nil {
+		if authDir, errAuthDir := resolveCooldownStateAuthDir(cfg); errAuthDir == nil && authDir != "" {
+			registry.SetModelCatalogStateDir(filepath.Join(authDir, "model-catalog"))
+		}
 		registry.StartModelCatalogUpdaters(ctx, cfg.Models, cfg.Home.Enabled)
 		proxyURL = cfg.ProxyURL
 	}
