@@ -49,3 +49,21 @@ func TestModelCatalogStateDirFallsBackToAuthDir(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+// A read-only config dir (e.g. /etc/cliproxy mounted ro) must not win: every
+// save would fail and every offline restart would fall back to the embed.
+func TestModelCatalogStateDirSkipsReadOnlyConfigDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	configDir := t.TempDir()
+	if err := os.Chmod(configDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(configDir, 0o700) })
+	authDir := t.TempDir()
+	got := modelCatalogStateDir(filepath.Join(configDir, "config.yaml"), &config.Config{AuthDir: authDir})
+	if want := filepath.Join(authDir, "model-catalog"); got != want {
+		t.Fatalf("read-only config dir: got %q, want %q", got, want)
+	}
+}
