@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
@@ -37,6 +38,7 @@ const (
 type CodexAuth struct {
 	httpClient        *http.Client
 	siwcAgentNameHint string
+	refreshJournal    RefreshJournal
 }
 
 const codexRefreshResultTTL = 5 * time.Minute
@@ -111,9 +113,14 @@ func NewCodexAuthWithProxyURL(cfg *config.Config, proxyURL string) *CodexAuth {
 		agentNameHint = cfg.Codex.EffectiveSignInWithChatGPTIdentifier()
 	}
 	sdkCfg.ProxyURL = effectiveProxyURL
+	var journal RefreshJournal
+	if cfg != nil && strings.TrimSpace(cfg.AuthDir) != "" {
+		journal = &FileRefreshJournal{Dir: cfg.AuthDir}
+	}
 	return &CodexAuth{
 		httpClient:        util.SetProxy(&sdkCfg, &http.Client{}),
 		siwcAgentNameHint: agentNameHint,
+		refreshJournal:    journal,
 	}
 }
 
@@ -267,7 +274,9 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 		}
 		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), codexRefreshTimeout)
 		defer cancelRefresh()
-		tokenData, errRefresh := o.refreshTokensSingleFlight(refreshCtx, refreshToken)
+		tokenData, errRefresh := journalRefresh(refreshCtx, o.journal(ctx), ClientID, refreshToken, func() (*CodexTokenData, error) {
+			return o.refreshTokensSingleFlight(refreshCtx, refreshToken)
+		}, decodeRefreshReceipt)
 		if errRefresh == nil {
 			cacheCodexRefreshResult(refreshKey, tokenData)
 		}
@@ -293,15 +302,15 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 
 	req, errReq := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(data.Encode()))
 	if errReq != nil {
-		return nil, fmt.Errorf("failed to create refresh request: %w", errReq)
+		return nil, &RefreshOutcomeUnknownError{Stage: "request-create", Cause: errReq}
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	resp, errDo := o.httpClient.Do(req)
+	resp, errDo := o.doRefreshRequest(req)
 	if errDo != nil {
-		return nil, fmt.Errorf("token refresh request failed: %w", errDo)
+		return nil, &RefreshOutcomeUnknownError{Stage: "transport", Cause: errDo}
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
@@ -311,11 +320,15 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 
 	body, errRead := io.ReadAll(resp.Body)
 	if errRead != nil {
-		return nil, fmt.Errorf("failed to read refresh response: %w", errRead)
+		return nil, &RefreshOutcomeUnknownError{Stage: "response-read", Cause: errRead}
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(body))
+		errResponse := fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(body))
+		if isNonRetryableRefreshErr(errResponse) {
+			return nil, errResponse
+		}
+		return nil, &RefreshOutcomeUnknownError{Stage: "response-status", Cause: errResponse}
 	}
 
 	var tokenResp struct {
@@ -326,8 +339,16 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken 
 		ExpiresIn    int    `json:"expires_in"`
 	}
 
-	if errUnmarshal := json.Unmarshal(body, &tokenResp); errUnmarshal != nil {
-		return nil, fmt.Errorf("failed to parse refresh response: %w", errUnmarshal)
+	if !ojson.ValidBytes(body) {
+		return nil, &RefreshOutcomeUnknownError{Stage: "response-decode"}
+	}
+	response := ojson.ParseBytes(body)
+	tokenResp.AccessToken = response.Get("access_token").String()
+	tokenResp.RefreshToken = response.Get("refresh_token").String()
+	tokenResp.IDToken = response.Get("id_token").String()
+	tokenResp.ExpiresIn = int(response.Get("expires_in").Int())
+	if response.Get("access_token").Type != ojson.String || strings.TrimSpace(tokenResp.AccessToken) == "" || response.Get("expires_in").Type != ojson.Number || tokenResp.ExpiresIn <= 0 || response.Get("refresh_token").Type != ojson.String || strings.TrimSpace(tokenResp.RefreshToken) == "" {
+		return nil, &RefreshOutcomeUnknownError{Stage: "response-decode"}
 	}
 
 	// Extract account ID from ID token
@@ -412,6 +433,9 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
 func isNonRetryableRefreshErr(err error) bool {
 	if err == nil {
 		return false
+	}
+	if IsRefreshOutcomeUnknown(err) {
+		return true
 	}
 	raw := strings.ToLower(err.Error())
 	for _, token := range []string{
